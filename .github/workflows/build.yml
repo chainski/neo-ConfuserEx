@@ -1,0 +1,157 @@
+name: Build neo-ConfuserEx
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.0.0-rc2)'
+        required: true
+        default: 'v1.0.0-rc2'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-2022
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+        fetch-depth: 0
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Setup NuGet
+      uses: nuget/setup-nuget@v1
+
+    - name: Restore NuGet packages
+      run: nuget restore Confuser2.sln
+
+    - name: Install legacy .NET Framework reference assemblies (NuGet)
+      shell: pwsh
+      run: |
+        # Provide reference assemblies for .NET Framework 4.0 and 4.6.1,
+        # which are missing from the windows-2022 runner image.
+        nuget install Microsoft.NETFramework.ReferenceAssemblies.net40  -Version 1.0.2 -OutputDirectory packages
+        nuget install Microsoft.NETFramework.ReferenceAssemblies.net461 -Version 1.0.2 -OutputDirectory packages
+
+        $destRoot = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework"
+        if (-not (Test-Path $destRoot)) {
+          New-Item -ItemType Directory -Path $destRoot -Force | Out-Null
+        }
+
+        Get-ChildItem -Path "packages\Microsoft.NETFramework.ReferenceAssemblies.*" -Directory | ForEach-Object {
+          $buildDir = Join-Path $_.FullName "build\.NETFramework"
+          if (Test-Path $buildDir) {
+            Get-ChildItem -Path $buildDir -Directory | ForEach-Object {
+              $target = Join-Path $destRoot $_.Name
+              if (-not (Test-Path $target)) {
+                New-Item -ItemType Directory -Path $target -Force | Out-Null
+              }
+              Copy-Item -Path "$($_.FullName)\*" -Destination $target -Recurse -Force
+              Write-Host "Installed reference assemblies: $($_.Name) -> $target"
+            }
+          }
+        }
+
+    - name: Build Solution
+      run: |
+        msbuild Confuser2.sln /t:Build /p:Configuration=Release /p:Platform="Any CPU" /p:RestorePackages=false /v:minimal /nologo
+
+    - name: Package Build Output
+      shell: pwsh
+      run: |
+        if (Test-Path "artifacts") { Remove-Item -Path "artifacts" -Recurse -Force }
+        New-Item -ItemType Directory -Path "artifacts" -Force | Out-Null
+        Copy-Item -Path "Release\bin\*" -Destination "artifacts" -Recurse -Force
+
+    - name: Create ZIP Archive
+      shell: pwsh
+      run: |
+        if (Test-Path "neo-ConfuserEx.zip") { Remove-Item -Path "neo-ConfuserEx.zip" -Force }
+        Compress-Archive -Path "artifacts\*" -DestinationPath "neo-ConfuserEx.zip" -Force
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: neo-ConfuserEx-build
+        path: neo-ConfuserEx.zip
+
+    - name: Compute release tag
+      id: release_tag
+      shell: pwsh
+      run: |
+        # Determine the tag once and reuse it for delete/create steps.
+        # - manual dispatch -> use the version input
+        # - tag push        -> use the tag name
+        # - branch push     -> unique build tag (v1.0.0-build.<run_number>)
+        if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+          $tag = "${{ inputs.version }}"
+        } elseif ("${{ github.ref_type }}" -eq "tag") {
+          $tag = "${{ github.ref_name }}"
+        } else {
+          $tag = "v1.0.0-build.${{ github.run_number }}"
+        }
+        "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        Write-Host "Computed release tag: $tag"
+
+    - name: Delete existing release (if any)
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        $tag = "${{ steps.release_tag.outputs.tag }}"
+        Write-Host "Checking for existing release with tag: $tag"
+
+        gh release delete "$tag" --yes --repo "${{ github.repository }}" 2>$null
+
+        if ($LASTEXITCODE -eq 0) {
+          Write-Host "Deleted existing release for tag: $tag"
+        } else {
+          Write-Host "No existing release found for tag: $tag (continuing)"
+        }
+
+        exit 0
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v3
+      with:
+        files: neo-ConfuserEx.zip
+        tag_name: ${{ steps.release_tag.outputs.tag }}
+        name: "${{ steps.release_tag.outputs.tag }}: Signed Integrity + Selective KoiVM"
+        body: |
+          ## v1.0.0-rc2 — Signed Integrity + Selective KoiVM
+
+          ### New Features
+          - **Signed Integrity Manifest**: RSA-2048 PKCS#1 v1.5 SHA-256 protection verifies signed digests of resources at runtime (manual or startup check modes)
+          - **Selective KoiVM Virtualization**: Explicit selection mode with annotation-based exclusion of injected helpers
+          - **Combined Integrity + KoiVM**: Both protections work together
+
+          ### Fixes
+          - `EnsureProtectionParameters` on all injected definitions (fixes `::Initialize()` not marked)
+          - KoiVM no longer virtualizes its own internal `Koi` type
+          - PluginPaths now propagate from CRPROJ `<plugin>` elements
+          - Matrix test infrastructure copies all protected files (fixes KoiVM.Runtime.dll resolution)
+
+          ### Reproducibility
+          - **180/180** tests pass across 4 matrices (5 seeds × 3 profiles × 3 samples)
+          - Deterministic: 90/90 repro matches, 90/90 structural diversity
+
+          ### Profiles
+          - **balanced**: rename + ctrl flow + constants + integrity (manual check)
+          - **strong**: rename + ctrl flow + constants + integrity (startup enforcement)
+          - **critical**: rename + ctrl flow + constants + integrity (startup enforcement)
+
+          ### Requirements
+          - Integrity: set `CONFUSER_INTEGRITY_KEY_PATH` env var to your RSA key XML
+          - KoiVM: use `-plugin` CLI flag or `<plugin>` CRPROJ element pointing to `KoiVM.Confuser.exe`
+
+          ### KoiVM Reference
+          - **Repo**: [XenocodeRCE/KoiVM](https://github.com/XenocodeRCE/KoiVM)
+          - **Commit**: `44447d` — fix: exclude Koi type from virtualization in IsInjectedHelper
+          - Branch `feat/selective-registration` at the time of RC2 tagging
